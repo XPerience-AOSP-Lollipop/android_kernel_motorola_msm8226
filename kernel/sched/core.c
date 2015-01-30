@@ -718,8 +718,6 @@ int tg_nop(struct task_group *tg, void *data)
 }
 #endif
 
-void update_cpu_load(struct rq *this_rq);
-
 static void set_load_weight(struct task_struct *p)
 {
 	int prio = p->static_prio - MAX_RT_PRIO;
@@ -1610,11 +1608,11 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 {
 	unsigned long flags;
 	int cpu, src_cpu, success = 0;
+	int notify = 0;
 
 	smp_wmb();
 	raw_spin_lock_irqsave(&p->pi_lock, flags);
-	src_cpu = task_cpu(p);
-	cpu = src_cpu;
+	src_cpu = cpu = task_cpu(p);
 
 	if (!(p->state & state))
 		goto out;
@@ -1656,6 +1654,9 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 		p->sched_class->task_waking(p);
 
 	cpu = select_task_rq(p, SD_BALANCE_WAKE, wake_flags);
+
+	/* Refresh src_cpu as it could have changed since we last read it */
+	src_cpu = task_cpu(p);
 	if (src_cpu != cpu) {
 		wake_flags |= WF_MIGRATED;
 		set_task_cpu(p, cpu);
@@ -1665,10 +1666,13 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	ttwu_queue(p, cpu);
 stat:
 	ttwu_stat(p, cpu, wake_flags);
+
+	if (src_cpu != cpu && task_notify_on_migrate(p))
+		notify = 1;
 out:
 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
 
-	if (src_cpu != cpu && task_notify_on_migrate(p))
+	if (notify)
 		atomic_notifier_call_chain(&migration_notifier_head,
 					   cpu, (void *)src_cpu);
 	return success;
@@ -2656,21 +2660,12 @@ decay_load_missed(unsigned long load, unsigned long missed_updates, int idx)
  * scheduler tick (TICK_NSEC). With tickless idle this will not be called
  * every tick. We fix it up based on jiffies.
  */
-void update_cpu_load(struct rq *this_rq)
+static void __update_cpu_load(struct rq *this_rq, unsigned long this_load,
+			      unsigned long pending_updates)
 {
-	unsigned long this_load = this_rq->load.weight;
-	unsigned long curr_jiffies = jiffies;
-	unsigned long pending_updates;
 	int i, scale;
 
 	this_rq->nr_load_updates++;
-
-	/* Avoid repeated calls on same jiffy, when moving in and out of idle */
-	if (curr_jiffies == this_rq->last_load_update_tick)
-		return;
-
-	pending_updates = curr_jiffies - this_rq->last_load_update_tick;
-	this_rq->last_load_update_tick = curr_jiffies;
 
 	/* Update our load: */
 	this_rq->cpu_load[0] = this_load; /* Fasttrack for idx 0 */
@@ -2696,9 +2691,45 @@ void update_cpu_load(struct rq *this_rq)
 	sched_avg_update(this_rq);
 }
 
+/*
+ * Called from nohz_idle_balance() to update the load ratings before doing the
+ * idle balance.
+ */
+void update_idle_cpu_load(struct rq *this_rq)
+{
+	unsigned long curr_jiffies = jiffies;
+	unsigned long load = this_rq->load.weight;
+	unsigned long pending_updates;
+
+	/*
+	 * Bloody broken means of dealing with nohz, but better than nothing..
+	 * jiffies is updated by one cpu, another cpu can drift wrt the jiffy
+	 * update and see 0 difference the one time and 2 the next, even though
+	 * we ticked at roughtly the same rate.
+	 *
+	 * Hence we only use this from nohz_idle_balance() and skip this
+	 * nonsense when called from the scheduler_tick() since that's
+	 * guaranteed a stable rate.
+	 */
+	if (load || curr_jiffies == this_rq->last_load_update_tick)
+		return;
+
+	pending_updates = curr_jiffies - this_rq->last_load_update_tick;
+	this_rq->last_load_update_tick = curr_jiffies;
+
+	__update_cpu_load(this_rq, load, pending_updates);
+}
+
+/*
+ * Called from scheduler_tick()
+ */
 static void update_cpu_load_active(struct rq *this_rq)
 {
-	update_cpu_load(this_rq);
+	/*
+	 * See the mess in update_idle_cpu_load().
+	 */
+	this_rq->last_load_update_tick = jiffies;
+	__update_cpu_load(this_rq, this_rq->load.weight, 1);
 
 	calc_load_account_active(this_rq);
 }
@@ -5453,16 +5484,25 @@ static void sd_free_ctl_entry(struct ctl_table **tablep)
 	*tablep = NULL;
 }
 
+static int min_load_idx = 0;
+static int max_load_idx = CPU_LOAD_IDX_MAX-1;
+
 static void
 set_table_entry(struct ctl_table *entry,
 		const char *procname, void *data, int maxlen,
-		umode_t mode, proc_handler *proc_handler)
+		umode_t mode, proc_handler *proc_handler,
+		bool load_idx)
 {
 	entry->procname = procname;
 	entry->data = data;
 	entry->maxlen = maxlen;
 	entry->mode = mode;
 	entry->proc_handler = proc_handler;
+
+	if (load_idx) {
+		entry->extra1 = &min_load_idx;
+		entry->extra2 = &max_load_idx;
+	}
 }
 
 static struct ctl_table *
@@ -5474,30 +5514,30 @@ sd_alloc_ctl_domain_table(struct sched_domain *sd)
 		return NULL;
 
 	set_table_entry(&table[0], "min_interval", &sd->min_interval,
-		sizeof(long), 0644, proc_doulongvec_minmax);
+		sizeof(long), 0644, proc_doulongvec_minmax, false);
 	set_table_entry(&table[1], "max_interval", &sd->max_interval,
-		sizeof(long), 0644, proc_doulongvec_minmax);
+		sizeof(long), 0644, proc_doulongvec_minmax, false);
 	set_table_entry(&table[2], "busy_idx", &sd->busy_idx,
-		sizeof(int), 0644, proc_dointvec_minmax);
+		sizeof(int), 0644, proc_dointvec_minmax, true);
 	set_table_entry(&table[3], "idle_idx", &sd->idle_idx,
-		sizeof(int), 0644, proc_dointvec_minmax);
+		sizeof(int), 0644, proc_dointvec_minmax, true);
 	set_table_entry(&table[4], "newidle_idx", &sd->newidle_idx,
-		sizeof(int), 0644, proc_dointvec_minmax);
+		sizeof(int), 0644, proc_dointvec_minmax, true);
 	set_table_entry(&table[5], "wake_idx", &sd->wake_idx,
-		sizeof(int), 0644, proc_dointvec_minmax);
+		sizeof(int), 0644, proc_dointvec_minmax, true);
 	set_table_entry(&table[6], "forkexec_idx", &sd->forkexec_idx,
-		sizeof(int), 0644, proc_dointvec_minmax);
+		sizeof(int), 0644, proc_dointvec_minmax, true);
 	set_table_entry(&table[7], "busy_factor", &sd->busy_factor,
-		sizeof(int), 0644, proc_dointvec_minmax);
+		sizeof(int), 0644, proc_dointvec_minmax, false);
 	set_table_entry(&table[8], "imbalance_pct", &sd->imbalance_pct,
-		sizeof(int), 0644, proc_dointvec_minmax);
+		sizeof(int), 0644, proc_dointvec_minmax, false);
 	set_table_entry(&table[9], "cache_nice_tries",
 		&sd->cache_nice_tries,
-		sizeof(int), 0644, proc_dointvec_minmax);
+		sizeof(int), 0644, proc_dointvec_minmax, false);
 	set_table_entry(&table[10], "flags", &sd->flags,
-		sizeof(int), 0644, proc_dointvec_minmax);
+		sizeof(int), 0644, proc_dointvec_minmax, false);
 	set_table_entry(&table[11], "name", sd->name,
-		CORENAME_MAX_SIZE, 0444, proc_dostring);
+		CORENAME_MAX_SIZE, 0444, proc_dostring, false);
 	/* &table[12] is terminator */
 
 	return table;
@@ -5667,7 +5707,6 @@ static int __cpuinit sched_cpu_active(struct notifier_block *nfb,
 				      unsigned long action, void *hcpu)
 {
 	switch (action & ~CPU_TASKS_FROZEN) {
-	case CPU_STARTING:
 	case CPU_DOWN_FAILED:
 		set_cpu_active((long)hcpu, true);
 		return NOTIFY_OK;
@@ -6216,7 +6255,7 @@ static const struct cpumask *cpu_cpu_mask(int cpu)
 	return cpumask_of_node(cpu_to_node(cpu));
 }
 
-int sched_smt_power_savings = 0, sched_mc_power_savings = 0;
+int sched_smt_power_savings = 0, sched_mc_power_savings = 2;
 
 struct sd_data {
 	struct sched_domain **__percpu sd;
@@ -8045,7 +8084,12 @@ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
 
 	runtime_enabled = quota != RUNTIME_INF;
 	runtime_was_enabled = cfs_b->quota != RUNTIME_INF;
-	account_cfs_bandwidth_used(runtime_enabled, runtime_was_enabled);
+	/*
+	 * If we need to toggle cfs_bandwidth_used, off->on must occur
+	 * before making related changes, and on->off must occur afterwards
+	 */
+	if (runtime_enabled && !runtime_was_enabled)
+		cfs_bandwidth_usage_inc();
 	raw_spin_lock_irq(&cfs_b->lock);
 	cfs_b->period = ns_to_ktime(period);
 	cfs_b->quota = quota;
@@ -8071,6 +8115,8 @@ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
 			unthrottle_cfs_rq(cfs_rq);
 		raw_spin_unlock_irq(&rq->lock);
 	}
+	if (runtime_was_enabled && !runtime_enabled)
+		cfs_bandwidth_usage_dec();
 out_unlock:
 	mutex_unlock(&cfs_constraints_mutex);
 

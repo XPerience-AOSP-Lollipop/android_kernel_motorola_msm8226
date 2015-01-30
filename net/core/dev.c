@@ -1628,6 +1628,7 @@ int dev_forward_skb(struct net_device *dev, struct sk_buff *skb)
 	skb->mark = 0;
 	secpath_reset(skb);
 	nf_reset(skb);
+	nf_reset_trace(skb);
 	return netif_rx(skb);
 }
 EXPORT_SYMBOL_GPL(dev_forward_skb);
@@ -1893,6 +1894,9 @@ static void skb_warn_bad_offload(const struct sk_buff *skb)
 	static const netdev_features_t null_features = 0;
 	struct net_device *dev = skb->dev;
 	const char *driver = "";
+
+	if (!net_ratelimit())
+		return;
 
 	if (dev && dev->dev.parent)
 		driver = dev_driver_string(dev->dev.parent);
@@ -2166,7 +2170,7 @@ EXPORT_SYMBOL(netif_skb_features);
  *	   support DMA from it.
  */
 static inline int skb_needs_linearize(struct sk_buff *skb,
-				      int features)
+				      netdev_features_t features)
 {
 	return skb_is_nonlinear(skb) &&
 			((skb_has_frag_list(skb) &&
@@ -3570,6 +3574,7 @@ static void napi_reuse_skb(struct napi_struct *napi, struct sk_buff *skb)
 	skb->vlan_tci = 0;
 	skb->dev = napi->dev;
 	skb->skb_iif = 0;
+	skb->truesize = SKB_TRUESIZE(skb_end_offset(skb));
 
 	napi->skb = skb;
 }
@@ -5541,13 +5546,8 @@ int register_netdevice(struct net_device *dev)
 	dev->features |= NETIF_F_SOFT_FEATURES;
 	dev->wanted_features = dev->features & dev->hw_features;
 
-	/* Turn on no cache copy if HW is doing checksum */
 	if (!(dev->flags & IFF_LOOPBACK)) {
 		dev->hw_features |= NETIF_F_NOCACHE_COPY;
-		if (dev->features & NETIF_F_ALL_CSUM) {
-			dev->wanted_features |= NETIF_F_NOCACHE_COPY;
-			dev->features |= NETIF_F_NOCACHE_COPY;
-		}
 	}
 
 	/* Make NETIF_F_HIGHDMA inheritable to VLAN devices.

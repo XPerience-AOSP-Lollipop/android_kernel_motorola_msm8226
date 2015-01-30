@@ -1446,9 +1446,9 @@ static void process_deferred_bios(struct pool *pool)
 		 */
 		if (ensure_next_mapping(pool)) {
 			spin_lock_irqsave(&pool->lock, flags);
+			bio_list_add(&pool->deferred_bios, bio);
 			bio_list_merge(&pool->deferred_bios, &bios);
 			spin_unlock_irqrestore(&pool->lock, flags);
-
 			break;
 		}
 
@@ -2027,6 +2027,7 @@ static int pool_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		 * thin devices' discard limits consistent).
 		 */
 		ti->discards_supported = 1;
+		ti->discard_zeroes_data_unsupported = 1;
 	}
 	ti->private = pt;
 
@@ -2443,7 +2444,6 @@ static void set_discard_limits(struct pool *pool, struct queue_limits *limits)
 	 * bios that overlap 2 blocks.
 	 */
 	limits->discard_granularity = pool->sectors_per_block << SECTOR_SHIFT;
-	limits->discard_zeroes_data = pool->pf.zero_new_blocks;
 }
 
 static void pool_io_hints(struct dm_target *ti, struct queue_limits *limits)
@@ -2461,7 +2461,7 @@ static struct target_type pool_target = {
 	.name = "thin-pool",
 	.features = DM_TARGET_SINGLETON | DM_TARGET_ALWAYS_WRITEABLE |
 		    DM_TARGET_IMMUTABLE,
-	.version = {1, 1, 0},
+	.version = {1, 1, 1},
 	.module = THIS_MODULE,
 	.ctr = pool_ctr,
 	.dtr = pool_dtr,
@@ -2734,7 +2734,7 @@ static void thin_io_hints(struct dm_target *ti, struct queue_limits *limits)
 
 static struct target_type thin_target = {
 	.name = "thin",
-	.version = {1, 1, 0},
+	.version = {1, 1, 1},
 	.module	= THIS_MODULE,
 	.ctr = thin_ctr,
 	.dtr = thin_dtr,

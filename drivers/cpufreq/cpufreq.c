@@ -431,6 +431,9 @@ static ssize_t store_##file_name					\
 	if (ret)							\
 		return -EINVAL;						\
 									\
+	new_policy.min = new_policy.user_policy.min;			\
+	new_policy.max = new_policy.user_policy.max;			\
+									\
 	ret = sscanf(buf, "%u", &new_policy.object);			\
 	if (ret != 1)							\
 		return -EINVAL;						\
@@ -439,7 +442,9 @@ static ssize_t store_##file_name					\
 	if (ret)							\
 		pr_err("cpufreq: Frequency verification failed\n");	\
 									\
-	policy->user_policy.object = new_policy.object;			\
+	policy->user_policy.min = new_policy.min;			\
+	policy->user_policy.max = new_policy.max;			\
+									\
 	ret = __cpufreq_set_policy(policy, &new_policy);		\
 									\
 	return ret ? ret : count;					\
@@ -1533,6 +1538,10 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
 
 	pr_debug("target for CPU %u: %u kHz, relation %u\n", policy->cpu,
 		target_freq, relation);
+
+	if (target_freq == policy->cur)
+		return 0;
+
 	if (cpu_online(policy->cpu) && cpufreq_driver->target)
 		retval = cpufreq_driver->target(policy, target_freq, relation);
 

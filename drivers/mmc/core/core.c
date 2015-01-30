@@ -3233,7 +3233,7 @@ void mmc_rescan(struct work_struct *work)
 	mmc_rpm_release(host, &host->class_dev);
  out:
 	if (stay_awake)
-		__pm_wakeup_event(&host->detect_ws, 2000);
+		__pm_wakeup_event(&host->detect_ws, 4000);
 	else
 		__pm_relax(&host->detect_ws);
 

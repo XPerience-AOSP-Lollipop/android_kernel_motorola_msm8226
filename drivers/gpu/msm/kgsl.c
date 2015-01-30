@@ -1572,6 +1572,9 @@ static void kgsl_cmdbatch_sync_func(struct kgsl_device *device, void *priv,
 {
 	struct kgsl_cmdbatch_sync_event *event = priv;
 
+	trace_syncpoint_timestamp_expire(event->cmdbatch,
+		event->context, event->timestamp);
+
 	kgsl_cmdbatch_sync_expire(device, event);
 	kgsl_context_put(event->context);
 	/* Put events that have signaled */
@@ -1636,6 +1639,12 @@ EXPORT_SYMBOL(kgsl_cmdbatch_destroy);
 static void kgsl_cmdbatch_sync_fence_func(void *priv)
 {
 	struct kgsl_cmdbatch_sync_event *event = priv;
+	char *name = "unknown";
+
+	if (event->handle && event->handle->fence)
+		name = event->handle->fence->name;
+
+	trace_syncpoint_fence_expire(event->cmdbatch, name);
 
 	kgsl_cmdbatch_sync_expire(event->device, event);
 	/* Put events that have signaled */
@@ -1711,8 +1720,17 @@ static int kgsl_cmdbatch_add_sync_fence(struct kgsl_device *device,
 		/* Event no longer needed by this function */
 		kgsl_cmdbatch_sync_event_put(event);
 
+		/*
+		 * If ret == 0 the fence was already signaled - print a trace
+		 * message so we can track that
+		 */
+		if (ret == 0)
+			trace_syncpoint_fence_expire(cmdbatch, "signaled");
+
 		return ret;
 	}
+
+	trace_syncpoint_fence(cmdbatch, event->handle->fence->name);
 
 	/*
 	 * Event was successfully added to the synclist, the async
@@ -1801,6 +1819,8 @@ static int kgsl_cmdbatch_add_sync_timestamp(struct kgsl_device *device,
 
 		kgsl_cmdbatch_put(cmdbatch);
 		kfree(event);
+	} else {
+		trace_syncpoint_timestamp(cmdbatch, context, sync->timestamp);
 	}
 
 done:
@@ -3060,6 +3080,9 @@ kgsl_ioctl_sharedmem_flush_cache(struct kgsl_device_private *dev_priv,
 	return ret;
 }
 
+/* The largest allowable alignment for a GPU object is 32MB */
+#define KGSL_MAX_ALIGN (32 * SZ_1M)
+
 /*
  * The common parts of kgsl_ioctl_gpumem_alloc and kgsl_ioctl_gpumem_alloc_id.
  */
@@ -3086,11 +3109,13 @@ _gpumem_alloc(struct kgsl_device_private *dev_priv,
 	/* Cap the alignment bits to the highest number we can handle */
 
 	align = (flags & KGSL_MEMALIGN_MASK) >> KGSL_MEMALIGN_SHIFT;
-	if (align >= 32) {
-		KGSL_CORE_ERR("Alignment too big, restricting to 2^31\n");
+	if (align >= ilog2(KGSL_MAX_ALIGN)) {
+		KGSL_CORE_ERR("Alignment too large; restricting to %dK\n",
+			KGSL_MAX_ALIGN >> 10);
 
 		flags &= ~KGSL_MEMALIGN_MASK;
-		flags |= (31 << KGSL_MEMALIGN_SHIFT) & KGSL_MEMALIGN_MASK;
+		flags |= (ilog2(KGSL_MAX_ALIGN) << KGSL_MEMALIGN_SHIFT) &
+			KGSL_MEMALIGN_MASK;
 	}
 
 	entry = kgsl_mem_entry_create();

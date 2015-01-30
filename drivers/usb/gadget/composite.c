@@ -593,6 +593,7 @@ static void reset_config(struct usb_composite_dev *cdev)
 		bitmap_zero(f->endpoints, 32);
 	}
 	cdev->config = NULL;
+	cdev->delayed_status = 0;
 }
 
 static int set_config(struct usb_composite_dev *cdev,
@@ -1230,7 +1231,7 @@ composite_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
 		 * upon set config#1. Call set_alt for non-zero
 		 * alternate setting.
 		 */
-		if (!w_value && cdev->config) {
+		if (!w_value && cdev->config && !f->get_alt) {
 			value = 0;
 			break;
 		}

@@ -65,6 +65,8 @@ static int spkr_drv_wrnd_param_set(const char *val,
 				   const struct kernel_param *kp);
 static int spkr_drv_wrnd = 1;
 
+int high_perf_mode = 0;
+
 static struct kernel_param_ops spkr_drv_wrnd_param_ops = {
 	.set = spkr_drv_wrnd_param_set,
 	.get = param_get_int,
@@ -303,6 +305,8 @@ struct tapan_priv {
 	int aux_pga_cnt;
 	u8 aux_l_gain;
 	u8 aux_r_gain;
+
+	bool dec_active[NUM_DECIMATORS];
 
 	bool spkr_pa_widget_on;
 
@@ -1903,7 +1907,7 @@ static int tapan_codec_enable_adc(struct snd_soc_dapm_widget *w,
 				1 << init_bit_shift);
 		break;
 	case SND_SOC_DAPM_POST_PMU:
-
+		usleep_range(2000, 2010);
 		snd_soc_update_bits(codec, adc_reg, 1 << init_bit_shift, 0x00);
 
 		break;
@@ -2330,6 +2334,7 @@ static void tx_hpf_corner_freq_callback(struct work_struct *work)
 	dev_dbg(codec->dev, "%s(): decimator %u hpf_cut_of_freq 0x%x\n",
 		 __func__, hpf_work->decimator, (unsigned int)hpf_cut_of_freq);
 
+	snd_soc_update_bits(codec, TAPAN_A_TX_1_2_TXFE_CLKDIV, 0x55, 0x55);
 	snd_soc_update_bits(codec, tx_mux_ctl_reg, 0x30, hpf_cut_of_freq << 4);
 }
 
@@ -2343,10 +2348,11 @@ static int tapan_codec_enable_dec(struct snd_soc_dapm_widget *w,
 {
 	struct snd_soc_codec *codec = w->codec;
 	unsigned int decimator;
+	struct tapan_priv *tapan_p = snd_soc_codec_get_drvdata(codec);
 	char *dec_name = NULL;
 	char *widget_name = NULL;
 	char *temp;
-	int ret = 0;
+	int ret = 0, i;
 	u16 dec_reset_reg, tx_vol_ctl_reg, tx_mux_ctl_reg;
 	u8 dec_hpf_cut_of_freq;
 	int offset;
@@ -2393,6 +2399,10 @@ static int tapan_codec_enable_dec(struct snd_soc_dapm_widget *w,
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
+		for (i = 0; i < NUM_DECIMATORS; i++) {
+			if (decimator == i + 1)
+				tapan_p->dec_active[i] = true;
+		}
 
 		/* Enableable TX digital mute */
 		snd_soc_update_bits(codec, tx_vol_ctl_reg, 0x01, 0x01);
@@ -2417,13 +2427,11 @@ static int tapan_codec_enable_dec(struct snd_soc_dapm_widget *w,
 
 		/* enable HPF */
 		snd_soc_update_bits(codec, tx_mux_ctl_reg , 0x08, 0x00);
-
+		snd_soc_update_bits(codec, TAPAN_A_TX_1_2_TXFE_CLKDIV,
+				0x55, 0x44);
 		break;
 
 	case SND_SOC_DAPM_POST_PMU:
-
-		/* Disable TX digital mute */
-		snd_soc_update_bits(codec, tx_vol_ctl_reg, 0x01, 0x00);
 
 		if (tx_hpf_work[decimator - 1].tx_hpf_cut_of_freq !=
 				CF_MIN_3DB_150HZ) {
@@ -2452,7 +2460,10 @@ static int tapan_codec_enable_dec(struct snd_soc_dapm_widget *w,
 		snd_soc_update_bits(codec, tx_mux_ctl_reg, 0x08, 0x08);
 		snd_soc_update_bits(codec, tx_mux_ctl_reg, 0x30,
 			(tx_hpf_work[decimator - 1].tx_hpf_cut_of_freq) << 4);
-
+		for (i = 0; i < NUM_DECIMATORS; i++) {
+			if (decimator == i + 1)
+				tapan_p->dec_active[i] = false;
+		}
 		break;
 	}
 out:
@@ -2617,10 +2628,16 @@ static int tapan_hphl_dac_event(struct snd_soc_dapm_widget *w,
 	case SND_SOC_DAPM_PRE_PMU:
 		snd_soc_update_bits(codec, TAPAN_A_CDC_CLK_RDAC_CLK_EN_CTL,
 							0x02, 0x02);
-		wcd9xxx_clsh_fsm(codec, &tapan_p->clsh_d,
+		if (!high_perf_mode)
+			wcd9xxx_clsh_fsm(codec, &tapan_p->clsh_d,
 						 WCD9XXX_CLSH_STATE_HPHL,
 						 WCD9XXX_CLSH_REQ_ENABLE,
 						 WCD9XXX_CLSH_EVENT_PRE_DAC);
+		else
+			wcd9xxx_enable_high_perf_mode(codec, &tapan_p->clsh_d,
+						WCD9XXX_CLSAB_STATE_HPHL,
+						WCD9XXX_CLSAB_REQ_ENABLE);
+
 		break;
 	case SND_SOC_DAPM_POST_PMD:
 		snd_soc_update_bits(codec, TAPAN_A_CDC_CLK_RDAC_CLK_EN_CTL,
@@ -2642,10 +2659,16 @@ static int tapan_hphr_dac_event(struct snd_soc_dapm_widget *w,
 		snd_soc_update_bits(codec, TAPAN_A_CDC_CLK_RDAC_CLK_EN_CTL,
 							0x04, 0x04);
 		snd_soc_update_bits(codec, w->reg, 0x40, 0x40);
-		wcd9xxx_clsh_fsm(codec, &tapan_p->clsh_d,
+
+		if (!high_perf_mode)
+			wcd9xxx_clsh_fsm(codec, &tapan_p->clsh_d,
 						 WCD9XXX_CLSH_STATE_HPHR,
 						 WCD9XXX_CLSH_REQ_ENABLE,
 						 WCD9XXX_CLSH_EVENT_PRE_DAC);
+		else
+			wcd9xxx_enable_high_perf_mode(codec, &tapan_p->clsh_d,
+						WCD9XXX_CLSAB_STATE_HPHR,
+						WCD9XXX_CLSAB_REQ_ENABLE);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
 		snd_soc_update_bits(codec, TAPAN_A_CDC_CLK_RDAC_CLK_EN_CTL,
@@ -2663,17 +2686,20 @@ static int tapan_hph_pa_event(struct snd_soc_dapm_widget *w,
 	struct tapan_priv *tapan = snd_soc_codec_get_drvdata(codec);
 	enum wcd9xxx_notify_event e_pre_on, e_post_off;
 	u8 req_clsh_state;
+	u8 req_clsab_state;
 	u32 pa_settle_time = TAPAN_HPH_PA_SETTLE_COMP_OFF;
 
 	dev_dbg(codec->dev, "%s: %s event = %d\n", __func__, w->name, event);
 	if (w->shift == 5) {
 		e_pre_on = WCD9XXX_EVENT_PRE_HPHL_PA_ON;
 		e_post_off = WCD9XXX_EVENT_POST_HPHL_PA_OFF;
-		req_clsh_state = WCD9XXX_CLSH_STATE_HPHR;
+		req_clsh_state = WCD9XXX_CLSH_STATE_HPHL;
+		req_clsab_state = WCD9XXX_CLSAB_STATE_HPHL;
 	} else if (w->shift == 4) {
 		e_pre_on = WCD9XXX_EVENT_PRE_HPHR_PA_ON;
 		e_post_off = WCD9XXX_EVENT_POST_HPHR_PA_OFF;
-		req_clsh_state = WCD9XXX_CLSH_STATE_HPHL;
+		req_clsh_state = WCD9XXX_CLSH_STATE_HPHR;
+		req_clsab_state = WCD9XXX_CLSAB_STATE_HPHR;
 	} else {
 		pr_err("%s: Invalid w->shift %d\n", __func__, w->shift);
 		return -EINVAL;
@@ -2693,7 +2719,8 @@ static int tapan_hph_pa_event(struct snd_soc_dapm_widget *w,
 		/* Time needed for PA to settle */
 		usleep_range(pa_settle_time, pa_settle_time + 1000);
 
-		wcd9xxx_clsh_fsm(codec, &tapan->clsh_d,
+		if (!high_perf_mode)
+			wcd9xxx_clsh_fsm(codec, &tapan->clsh_d,
 						 req_clsh_state,
 						 WCD9XXX_CLSH_REQ_ENABLE,
 						 WCD9XXX_CLSH_EVENT_POST_PA);
@@ -2708,10 +2735,15 @@ static int tapan_hph_pa_event(struct snd_soc_dapm_widget *w,
 		/* Let MBHC module know PA turned off */
 		wcd9xxx_resmgr_notifier_call(&tapan->resmgr, e_post_off);
 
-		wcd9xxx_clsh_fsm(codec, &tapan->clsh_d,
+		if (!high_perf_mode)
+			wcd9xxx_clsh_fsm(codec, &tapan->clsh_d,
 						 req_clsh_state,
 						 WCD9XXX_CLSH_REQ_DISABLE,
 						 WCD9XXX_CLSH_EVENT_POST_PA);
+		else
+			wcd9xxx_enable_high_perf_mode(codec, &tapan->clsh_d,
+						req_clsab_state,
+						WCD9XXX_CLSAB_REQ_DISABLE);
 		break;
 	}
 	return 0;
@@ -3238,27 +3270,17 @@ static int tapan_volatile(struct snd_soc_codec *ssc, unsigned int reg)
 }
 
 #define TAPAN_FORMATS (SNDRV_PCM_FMTBIT_S16_LE)
-static int tapan_write(struct snd_soc_codec *codec, unsigned int reg,
-	unsigned int value)
-{
-	int ret;
-	struct wcd9xxx *wcd9xxx = codec->control_data;
 
-	if (reg == SND_SOC_NOPM)
-		return 0;
+#ifdef CONFIG_SOUND_CONTROL_HAX_3_GPL
+extern int snd_hax_reg_access(unsigned int);
+extern unsigned int snd_hax_cache_read(unsigned int);
+extern void snd_hax_cache_write(unsigned int, unsigned int);
+#endif
 
-	BUG_ON(reg > TAPAN_MAX_REGISTER);
-
-	if (!tapan_volatile(codec, reg)) {
-		ret = snd_soc_cache_write(codec, reg, value);
-		if (ret != 0)
-			dev_err(codec->dev, "Cache write to %x failed: %d\n",
-				reg, ret);
-	}
-
-	return wcd9xxx_reg_write(&wcd9xxx->core_res, reg, value);
-}
-static unsigned int tapan_read(struct snd_soc_codec *codec,
+#ifndef CONFIG_SOUND_CONTROL_HAX_3_GPL
+static
+#endif
+unsigned int tapan_read(struct snd_soc_codec *codec,
 				unsigned int reg)
 {
 	unsigned int val;
@@ -3283,6 +3305,53 @@ static unsigned int tapan_read(struct snd_soc_codec *codec,
 	val = wcd9xxx_reg_read(&wcd9xxx->core_res, reg);
 	return val;
 }
+#ifdef CONFIG_SOUND_CONTROL_HAX_3_GPL
+EXPORT_SYMBOL(tapan_read);
+#endif
+
+#ifndef CONFIG_SOUND_CONTROL_HAX_3_GPL
+static
+#endif
+int tapan_write(struct snd_soc_codec *codec, unsigned int reg,
+	unsigned int value)
+{
+	int ret;
+	struct wcd9xxx *wcd9xxx = codec->control_data;
+#ifdef CONFIG_SOUND_CONTROL_HAX_3_GPL
+	int val;
+#endif
+
+	if (reg == SND_SOC_NOPM)
+		return 0;
+
+	BUG_ON(reg > TAPAN_MAX_REGISTER);
+
+	if (!tapan_volatile(codec, reg)) {
+		ret = snd_soc_cache_write(codec, reg, value);
+		if (ret != 0)
+			dev_err(codec->dev, "Cache write to %x failed: %d\n",
+				reg, ret);
+	}
+
+#ifdef CONFIG_SOUND_CONTROL_HAX_3_GPL
+	if (!snd_hax_reg_access(reg)) {
+		if (!((val = snd_hax_cache_read(reg)) != -1)) {
+			val = wcd9xxx_reg_read_safe(codec->control_data, reg);
+		}
+	} else {
+		snd_hax_cache_write(reg, value);
+		val = value;
+	}
+	return wcd9xxx_reg_write(&wcd9xxx->core_res, reg, val);
+#else
+	return wcd9xxx_reg_write(&wcd9xxx->core_res, reg, value);
+#endif
+
+	return wcd9xxx_reg_write(&wcd9xxx->core_res, reg, value);
+}
+#ifdef CONFIG_SOUND_CONTROL_HAX_3_GPL
+EXPORT_SYMBOL(tapan_write);
+#endif
 
 static int tapan_startup(struct snd_pcm_substream *substream,
 		struct snd_soc_dai *dai)
@@ -3792,6 +3861,53 @@ static int tapan_hw_params(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+int tapan_digital_mute(struct snd_soc_dai *dai, int mute)
+{
+	struct snd_soc_codec *codec = NULL;
+	u16 tx_vol_ctl_reg = 0;
+	u8 decimator = 0, i;
+	struct tapan_priv *tapan_p;
+
+	pr_debug("%s: Digital Mute val = %d\n", __func__, mute);
+
+	if (!dai || !dai->codec) {
+		pr_err("%s: Invalid params\n", __func__);
+		return -EINVAL;
+	}
+	codec = dai->codec;
+	tapan_p = snd_soc_codec_get_drvdata(codec);
+
+	if (dai->id != AIF1_CAP) {
+		dev_dbg(codec->dev, "%s: Not capture use case skip\n",
+		__func__);
+		return 0;
+	}
+
+	mute = (mute) ? 1 : 0;
+	if (!mute) {
+		/*
+		 * 5 ms is an emperical value for the mute time
+		 * that was arrived by checking the pop level
+		 * to be inaudible
+		 */
+		usleep_range(5000, 5010);
+	}
+
+	for (i = 0; i < NUM_DECIMATORS; i++) {
+		if (tapan_p->dec_active[i])
+			decimator = i + 1;
+		if (decimator && decimator <= NUM_DECIMATORS) {
+			pr_debug("%s: Mute = %d Decimator = %d", __func__,
+					mute, decimator);
+			tx_vol_ctl_reg = TAPAN_A_CDC_TX1_VOL_CTL_CFG +
+				8 * (decimator - 1);
+			snd_soc_update_bits(codec, tx_vol_ctl_reg, 0x01, mute);
+		}
+		decimator = 0;
+	}
+	return 0;
+}
+
 static struct snd_soc_dai_ops tapan_dai_ops = {
 	.startup = tapan_startup,
 	.shutdown = tapan_shutdown,
@@ -3800,6 +3916,7 @@ static struct snd_soc_dai_ops tapan_dai_ops = {
 	.set_fmt = tapan_set_dai_fmt,
 	.set_channel_map = tapan_set_channel_map,
 	.get_channel_map = tapan_get_channel_map,
+	.digital_mute = tapan_digital_mute,
 };
 
 static struct snd_soc_dai_driver tapan9302_dai[] = {
@@ -5805,6 +5922,15 @@ static bool tapan_check_wcd9306(struct device *cdc_dev, bool sensed)
 	return ret;
 };
 
+#ifdef CONFIG_SOUND_CONTROL_HAX_3_GPL
+struct snd_kcontrol_new *gpl_faux_snd_controls_ptr =
+		(struct snd_kcontrol_new *)tapan_common_snd_controls;
+struct snd_soc_codec *fauxsound_codec_ptr;
+EXPORT_SYMBOL(fauxsound_codec_ptr);
+int wcd9xxx_hw_revision;
+EXPORT_SYMBOL(wcd9xxx_hw_revision);
+#endif
+
 static int tapan_codec_probe(struct snd_soc_codec *codec)
 {
 	struct wcd9xxx *control;
@@ -5817,9 +5943,20 @@ static int tapan_codec_probe(struct snd_soc_codec *codec)
 	void *ptr = NULL;
 	struct wcd9xxx_core_resource *core_res;
 
+#ifdef CONFIG_SOUND_CONTROL_HAX_3_GPL
+	pr_info("tapan codec probe...\n");
+	fauxsound_codec_ptr = codec;
+#endif
+
 	codec->control_data = dev_get_drvdata(codec->dev->parent);
 	control = codec->control_data;
 
+#ifdef CONFIG_SOUND_CONTROL_HAX_3_GPL
+	if (TAPAN_IS_1_0(control->version))
+		wcd9xxx_hw_revision = 1;
+	else
+		wcd9xxx_hw_revision = 2;
+#endif
 	wcd9xxx_ssr_register(control, tapan_device_down,
 			     tapan_post_reset_cb, (void *)codec);
 

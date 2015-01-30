@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -28,7 +28,11 @@ static DEFINE_SPINLOCK(tz_lock);
  * FLOOR is 5msec to capture up to 3 re-draws
  * per frame for 60fps content.
  */
-#define FLOOR			5000
+#define FLOOR		        5000
+/*
+ * MIN_BUSY is 1 msec for the sample to be sent
+ */
+#define MIN_BUSY		1000
 #define LONG_FLOOR		50000
 #define HIST			5
 #define TARGET			80
@@ -80,6 +84,12 @@ static void _update_cutoff(struct devfreq_msm_adreno_tz_data *priv,
 	}
 }
 
+#ifdef CONFIG_SIMPLE_GPU_ALGORITHM
+extern int simple_gpu_active;
+extern int simple_gpu_algorithm(int level,
+				struct devfreq_msm_adreno_tz_data *priv);
+#endif
+
 static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq,
 				u32 *flag)
 {
@@ -116,11 +126,13 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq,
 	/*
 	 * Do not waste CPU cycles running this algorithm if
 	 * the GPU just started, or if less than FLOOR time
-	 * has passed since the last run.
+	 * has passed since the last run or the gpu hasn't been
+	 * busier than MIN_BUSY.
 	 */
 	if ((stats.total_time == 0) ||
-		(priv->bin.total_time < FLOOR)) {
-		return 1;
+		(priv->bin.total_time < FLOOR) ||
+		(unsigned int) priv->bin.busy_time < MIN_BUSY) {
+		return 0;
 	}
 
 	level = devfreq_get_freq_level(devfreq, stats.current_frequency);
@@ -137,10 +149,20 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq,
 	if (priv->bin.busy_time > CEILING) {
 		val = -1 * level;
 	} else {
+#ifdef CONFIG_SIMPLE_GPU_ALGORITHM
+		if (simple_gpu_active != 0)
+			val = simple_gpu_algorithm(level, priv);
+		else
+			val = __secure_tz_entry3(TZ_UPDATE_ID,
+					level,
+					priv->bin.total_time,
+					priv->bin.busy_time);
+#else
 		val = __secure_tz_entry3(TZ_UPDATE_ID,
 				level,
 				priv->bin.total_time,
 				priv->bin.busy_time);
+#endif
 	}
 	priv->bin.total_time = 0;
 	priv->bin.busy_time = 0;

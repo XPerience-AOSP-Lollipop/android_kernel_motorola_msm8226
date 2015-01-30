@@ -3889,8 +3889,15 @@ static int voice_cvs_start_record(struct voice_data *v, uint32_t rec_mode)
 		cvs_start_record.hdr.token = 0;
 		cvs_start_record.hdr.opcode = VSS_IRECORD_CMD_START;
 
+		// In order to enable stereo recording,
+		// i.e. TX on the left and RX on the right
+		// the respective ports need to be explicitly specified:
+		// INCALL_RECORD_TX => 0x8003
+		// INCALL_RECORD_RX => 0x8004
+		/*cvs_start_record.rec_mode.port_id =
+					VSS_IRECORD_PORT_ID_DEFAULT; */
 		cvs_start_record.rec_mode.port_id =
-					VSS_IRECORD_PORT_ID_DEFAULT;
+					VSS_IRECORD_PORT_ID_TX_RX;
 		if (rec_mode == VOC_REC_UPLINK) {
 			cvs_start_record.rec_mode.rx_tap_point =
 					VSS_IRECORD_TAP_POINT_NONE;
@@ -3913,6 +3920,9 @@ static int voice_cvs_start_record(struct voice_data *v, uint32_t rec_mode)
 			ret = -EINVAL;
 			goto fail;
 		}
+
+		// request stereo recording
+		cvs_start_record.rec_mode.mode = VSS_IRECORD_MODE_TX_RX_STEREO;
 
 		v->cvs_state = CMD_STATUS_FAIL;
 
@@ -5036,10 +5046,12 @@ exit:
 
 void voc_register_mvs_cb(ul_cb_fn ul_cb,
 			   dl_cb_fn dl_cb,
+			   voip_ssr_cb ssr_cb,
 			   void *private_data)
 {
 	common.mvs_info.ul_cb = ul_cb;
 	common.mvs_info.dl_cb = dl_cb;
+	common.mvs_info.ssr_cb = ssr_cb;
 	common.mvs_info.private_data = private_data;
 }
 
@@ -5090,6 +5102,14 @@ static int32_t qdsp_mvm_callback(struct apr_client_data *data, void *priv)
 		} else {
 			pr_debug("%s: Reset event received in Voice service\n",
 				__func__);
+
+			if (common.mvs_info.ssr_cb) {
+				pr_debug("%s: Informing reset event to VoIP\n",
+					__func__);
+				common.mvs_info.ssr_cb(data->opcode,
+						common.mvs_info.private_data);
+			}
+
 			apr_reset(c->apr_q6_mvm);
 			c->apr_q6_mvm = NULL;
 

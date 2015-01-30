@@ -508,6 +508,9 @@ struct vss_imemory_cmd_unmap_t {
 #define VSS_IRECORD_PORT_ID_DEFAULT			0x0000FFFF
 /* Default AFE port ID. */
 
+#define VSS_IRECORD_PORT_ID_TX_RX			0x00008003
+/* Port explicitly identifying TX and RX streams */
+
 #define VSS_IRECORD_TAP_POINT_NONE			0x00010F78
 /* Indicates no tapping for specified path. */
 
@@ -1226,6 +1229,9 @@ typedef void (*dtmf_rx_det_cb_fn)(uint8_t *pkt,
 				  char *session,
 				  void *private_data);
 
+typedef void (*voip_ssr_cb) (uint32_t opcode,
+				void *private_data);
+
 struct mvs_driver_info {
 	uint32_t media_type;
 	uint32_t rate;
@@ -1233,6 +1239,7 @@ struct mvs_driver_info {
 	uint32_t dtx_mode;
 	ul_cb_fn ul_cb;
 	dl_cb_fn dl_cb;
+	voip_ssr_cb ssr_cb;
 	void *private_data;
 	uint32_t evrc_min_rate;
 	uint32_t evrc_max_rate;
@@ -1365,6 +1372,7 @@ struct voice_session_itr {
 
 void voc_register_mvs_cb(ul_cb_fn ul_cb,
 			dl_cb_fn dl_cb,
+			voip_ssr_cb ssr_cb,
 			void *private_data);
 
 void voc_register_dtmf_rx_detection_cb(dtmf_rx_det_cb_fn dtmf_rx_ul_cb,

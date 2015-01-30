@@ -42,6 +42,7 @@
 #include <linux/lockdep.h>
 #include <linux/idr.h>
 #include <linux/bug.h>
+#include <linux/moduleparam.h>
 
 #include "workqueue_sched.h"
 
@@ -261,18 +262,31 @@ struct workqueue_struct {
 	char			name[];		/* I: workqueue name */
 };
 
+/* see the comment above the definition of WQ_POWER_EFFICIENT */
+#ifdef CONFIG_WQ_POWER_EFFICIENT_DEFAULT
+static bool wq_power_efficient = true;
+#else
+static bool wq_power_efficient;
+#endif
+
+module_param_named(power_efficient, wq_power_efficient, bool, 0444);
+
 struct workqueue_struct *system_wq __read_mostly;
 struct workqueue_struct *system_long_wq __read_mostly;
 struct workqueue_struct *system_nrt_wq __read_mostly;
 struct workqueue_struct *system_unbound_wq __read_mostly;
 struct workqueue_struct *system_freezable_wq __read_mostly;
 struct workqueue_struct *system_nrt_freezable_wq __read_mostly;
+struct workqueue_struct *system_power_efficient_wq __read_mostly;
+struct workqueue_struct *system_freezable_power_efficient_wq __read_mostly;
 EXPORT_SYMBOL_GPL(system_wq);
 EXPORT_SYMBOL_GPL(system_long_wq);
 EXPORT_SYMBOL_GPL(system_nrt_wq);
 EXPORT_SYMBOL_GPL(system_unbound_wq);
 EXPORT_SYMBOL_GPL(system_freezable_wq);
 EXPORT_SYMBOL_GPL(system_nrt_freezable_wq);
+EXPORT_SYMBOL_GPL(system_power_efficient_wq);
+EXPORT_SYMBOL_GPL(system_freezable_power_efficient_wq);
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/workqueue.h>
@@ -877,9 +891,27 @@ static struct worker *__find_worker_executing_work(struct global_cwq *gcwq,
  * @gcwq: gcwq of interest
  * @work: work to find worker for
  *
- * Find a worker which is executing @work on @gcwq.  This function is
- * identical to __find_worker_executing_work() except that this
- * function calculates @bwh itself.
+ * Find a worker which is executing @work on @gcwq by searching
+ * @gcwq->busy_hash which is keyed by the address of @work.  For a worker
+ * to match, its current execution should match the address of @work and
+ * its work function.  This is to avoid unwanted dependency between
+ * unrelated work executions through a work item being recycled while still
+ * being executed.
+ *
+ * This is a bit tricky.  A work item may be freed once its execution
+ * starts and nothing prevents the freed area from being recycled for
+ * another work item.  If the same work item address ends up being reused
+ * before the original execution finishes, workqueue will identify the
+ * recycled work item as currently executing and make it wait until the
+ * current execution finishes, introducing an unwanted dependency.
+ *
+ * This function checks the work item address, work function and workqueue
+ * to avoid false positives.  Note that this isn't complete as one may
+ * construct a work function which can introduce dependency onto itself
+ * through a recycled work item.  Well, if somebody wants to shoot oneself
+ * in the foot that badly, there's only so much we can do, and if such
+ * deadlock actually occurs, it should be easy to locate the culprit work
+ * function.
  *
  * CONTEXT:
  * spin_lock_irq(gcwq->lock).
@@ -1878,8 +1910,8 @@ __acquires(&gcwq->lock)
 		printk(KERN_ERR "BUG: workqueue leaked lock or atomic: "
 		       "%s/0x%08x/%d\n",
 		       current->comm, preempt_count(), task_pid_nr(current));
-		printk(KERN_ERR "    last function: ");
-		print_symbol("%s\n", (unsigned long)f);
+		       printk(KERN_ERR " last function: ");
+		       print_symbol("%s\n", (unsigned long)f);
 		debug_show_held_locks(current);
 		BUG_ON(PANIC_CORRUPTION);
 		dump_stack();
@@ -2626,6 +2658,7 @@ static int try_to_grab_pending(struct work_struct *work)
 		smp_rmb();
 		if (gcwq == get_work_gcwq(work)) {
 			debug_work_deactivate(work);
+
 			list_del_init(&work->entry);
 			cwq_dec_nr_in_flight(get_work_cwq(work),
 				get_work_color(work),
@@ -2960,6 +2993,10 @@ struct workqueue_struct *__alloc_workqueue_key(const char *fmt,
 	struct workqueue_struct *wq;
 	unsigned int cpu;
 	size_t namelen;
+
+	/* see the comment above the definition of WQ_POWER_EFFICIENT */
+	if ((flags & WQ_POWER_EFFICIENT) && wq_power_efficient)
+		flags |= WQ_UNBOUND;
 
 	/* determine namelen, allocate wq and format name */
 	va_start(args, lock_name);
@@ -3931,9 +3968,15 @@ static int __init init_workqueues(void)
 					      WQ_FREEZABLE, 0);
 	system_nrt_freezable_wq = alloc_workqueue("events_nrt_freezable",
 			WQ_NON_REENTRANT | WQ_FREEZABLE, 0);
+	system_power_efficient_wq = alloc_workqueue("events_power_efficient",
+					      WQ_POWER_EFFICIENT, 0);
+	system_freezable_power_efficient_wq = alloc_workqueue("events_freezable_power_efficient",
+					      WQ_FREEZABLE | WQ_POWER_EFFICIENT,
+					      0);
 	BUG_ON(!system_wq || !system_long_wq || !system_nrt_wq ||
 	       !system_unbound_wq || !system_freezable_wq ||
-		!system_nrt_freezable_wq);
+               !system_nrt_freezable_wq || !system_power_efficient_wq ||
+	       !system_freezable_power_efficient_wq);
 	return 0;
 }
 early_initcall(init_workqueues);
